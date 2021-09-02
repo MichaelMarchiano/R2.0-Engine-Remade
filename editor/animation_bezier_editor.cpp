@@ -1016,7 +1016,7 @@ void AnimationBezierTrackEdit::gui_input(const Ref<InputEvent> &p_event) {
 		update();
 	}
 }
-
+''
 void AnimationBezierTrackEdit::_menu_selected(int p_index) {
 	switch (p_index) {
 		case MENU_KEY_INSERT: {
