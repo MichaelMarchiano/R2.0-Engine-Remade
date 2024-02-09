@@ -1,46 +1,47 @@
-/*************************************************************************/
-/*  collision_object_2d.cpp                                              */
-/*************************************************************************/
-/*                       This file is part of:                           */
-/*                           GODOT ENGINE                                */
-/*                      https://godotengine.org                          */
-/*************************************************************************/
-/* Copyright (c) 2007-2021 Juan Linietsky, Ariel Manzur.                 */
-/* Copyright (c) 2014-2021 Godot Engine contributors (cf. AUTHORS.md).   */
-/*                                                                       */
-/* Permission is hereby granted, free of charge, to any person obtaining */
-/* a copy of this software and associated documentation files (the       */
-/* "Software"), to deal in the Software without restriction, including   */
-/* without limitation the rights to use, copy, modify, merge, publish,   */
-/* distribute, sublicense, and/or sell copies of the Software, and to    */
-/* permit persons to whom the Software is furnished to do so, subject to */
-/* the following conditions:                                             */
-/*                                                                       */
-/* The above copyright notice and this permission notice shall be        */
-/* included in all copies or substantial portions of the Software.       */
-/*                                                                       */
-/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,       */
-/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF    */
-/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.*/
-/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY  */
-/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,  */
-/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE     */
-/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                */
-/*************************************************************************/
+/**************************************************************************/
+/*  collision_object_2d.cpp                                               */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
 
 #include "collision_object_2d.h"
 
+#include "scene/resources/world_2d.h"
 #include "scene/scene_string_names.h"
 
 void CollisionObject2D::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_ENTER_TREE: {
-			Transform2D global_transform = get_global_transform();
+			Transform2D gl_transform = get_global_transform();
 
 			if (area) {
-				PhysicsServer2D::get_singleton()->area_set_transform(rid, global_transform);
+				PhysicsServer2D::get_singleton()->area_set_transform(rid, gl_transform);
 			} else {
-				PhysicsServer2D::get_singleton()->body_set_state(rid, PhysicsServer2D::BODY_STATE_TRANSFORM, global_transform);
+				PhysicsServer2D::get_singleton()->body_set_state(rid, PhysicsServer2D::BODY_STATE_TRANSFORM, gl_transform);
 			}
 
 			bool disabled = !is_enabled();
@@ -50,12 +51,15 @@ void CollisionObject2D::_notification(int p_what) {
 			}
 
 			if (!disabled || (disable_mode != DISABLE_MODE_REMOVE)) {
-				RID space = get_world_2d()->get_space();
+				Ref<World2D> world_ref = get_world_2d();
+				ERR_FAIL_COND(!world_ref.is_valid());
+				RID space = world_ref->get_space();
 				if (area) {
 					PhysicsServer2D::get_singleton()->area_set_space(rid, space);
 				} else {
 					PhysicsServer2D::get_singleton()->body_set_space(rid, space);
 				}
+				_space_changed(space);
 			}
 
 			_update_pickable();
@@ -78,12 +82,12 @@ void CollisionObject2D::_notification(int p_what) {
 				return;
 			}
 
-			Transform2D global_transform = get_global_transform();
+			Transform2D gl_transform = get_global_transform();
 
 			if (area) {
-				PhysicsServer2D::get_singleton()->area_set_transform(rid, global_transform);
+				PhysicsServer2D::get_singleton()->area_set_transform(rid, gl_transform);
 			} else {
-				PhysicsServer2D::get_singleton()->body_set_state(rid, PhysicsServer2D::BODY_STATE_TRANSFORM, global_transform);
+				PhysicsServer2D::get_singleton()->body_set_state(rid, PhysicsServer2D::BODY_STATE_TRANSFORM, gl_transform);
 			}
 		} break;
 
@@ -91,10 +95,15 @@ void CollisionObject2D::_notification(int p_what) {
 			bool disabled = !is_enabled();
 
 			if (!disabled || (disable_mode != DISABLE_MODE_REMOVE)) {
-				if (area) {
-					PhysicsServer2D::get_singleton()->area_set_space(rid, RID());
+				if (callback_lock > 0) {
+					ERR_PRINT("Removing a CollisionObject node during a physics callback is not allowed and will cause undesired behavior. Remove with call_deferred() instead.");
 				} else {
-					PhysicsServer2D::get_singleton()->body_set_space(rid, RID());
+					if (area) {
+						PhysicsServer2D::get_singleton()->area_set_space(rid, RID());
+					} else {
+						PhysicsServer2D::get_singleton()->body_set_space(rid, RID());
+					}
+					_space_changed(RID());
 				}
 			}
 
@@ -109,6 +118,16 @@ void CollisionObject2D::_notification(int p_what) {
 			} else {
 				PhysicsServer2D::get_singleton()->body_attach_canvas_instance_id(rid, ObjectID());
 			}
+		} break;
+
+		case NOTIFICATION_WORLD_2D_CHANGED: {
+			RID space = get_world_2d()->get_space();
+			if (area) {
+				PhysicsServer2D::get_singleton()->area_set_space(rid, space);
+			} else {
+				PhysicsServer2D::get_singleton()->body_set_space(rid, space);
+			}
+			_space_changed(space);
 		} break;
 
 		case NOTIFICATION_DISABLED: {
@@ -150,13 +169,13 @@ uint32_t CollisionObject2D::get_collision_mask() const {
 void CollisionObject2D::set_collision_layer_value(int p_layer_number, bool p_value) {
 	ERR_FAIL_COND_MSG(p_layer_number < 1, "Collision layer number must be between 1 and 32 inclusive.");
 	ERR_FAIL_COND_MSG(p_layer_number > 32, "Collision layer number must be between 1 and 32 inclusive.");
-	uint32_t collision_layer = get_collision_layer();
+	uint32_t collision_layer_new = get_collision_layer();
 	if (p_value) {
-		collision_layer |= 1 << (p_layer_number - 1);
+		collision_layer_new |= 1 << (p_layer_number - 1);
 	} else {
-		collision_layer &= ~(1 << (p_layer_number - 1));
+		collision_layer_new &= ~(1 << (p_layer_number - 1));
 	}
-	set_collision_layer(collision_layer);
+	set_collision_layer(collision_layer_new);
 }
 
 bool CollisionObject2D::get_collision_layer_value(int p_layer_number) const {
@@ -181,6 +200,17 @@ bool CollisionObject2D::get_collision_mask_value(int p_layer_number) const {
 	ERR_FAIL_COND_V_MSG(p_layer_number < 1, false, "Collision layer number must be between 1 and 32 inclusive.");
 	ERR_FAIL_COND_V_MSG(p_layer_number > 32, false, "Collision layer number must be between 1 and 32 inclusive.");
 	return get_collision_mask() & (1 << (p_layer_number - 1));
+}
+
+void CollisionObject2D::set_collision_priority(real_t p_priority) {
+	collision_priority = p_priority;
+	if (!area) {
+		PhysicsServer2D::get_singleton()->body_set_collision_priority(get_rid(), p_priority);
+	}
+}
+
+real_t CollisionObject2D::get_collision_priority() const {
+	return collision_priority;
 }
 
 void CollisionObject2D::set_disable_mode(DisableMode p_mode) {
@@ -211,10 +241,15 @@ void CollisionObject2D::_apply_disabled() {
 	switch (disable_mode) {
 		case DISABLE_MODE_REMOVE: {
 			if (is_inside_tree()) {
-				if (area) {
-					PhysicsServer2D::get_singleton()->area_set_space(rid, RID());
+				if (callback_lock > 0) {
+					ERR_PRINT("Disabling a CollisionObject node during a physics callback is not allowed and will cause undesired behavior. Disable with call_deferred() instead.");
 				} else {
-					PhysicsServer2D::get_singleton()->body_set_space(rid, RID());
+					if (area) {
+						PhysicsServer2D::get_singleton()->area_set_space(rid, RID());
+					} else {
+						PhysicsServer2D::get_singleton()->body_set_space(rid, RID());
+					}
+					_space_changed(RID());
 				}
 			}
 		} break;
@@ -241,6 +276,7 @@ void CollisionObject2D::_apply_enabled() {
 				} else {
 					PhysicsServer2D::get_singleton()->body_set_space(rid, space);
 				}
+				_space_changed(space);
 			}
 		} break;
 
@@ -266,7 +302,7 @@ uint32_t CollisionObject2D::create_shape_owner(Object *p_owner) {
 		id = shapes.back()->key() + 1;
 	}
 
-	sd.owner = p_owner;
+	sd.owner_id = p_owner ? p_owner->get_instance_id() : ObjectID();
 
 	shapes[id] = sd;
 
@@ -342,15 +378,15 @@ real_t CollisionObject2D::get_shape_owner_one_way_collision_margin(uint32_t p_ow
 }
 
 void CollisionObject2D::get_shape_owners(List<uint32_t> *r_owners) {
-	for (Map<uint32_t, ShapeData>::Element *E = shapes.front(); E; E = E->next()) {
-		r_owners->push_back(E->key());
+	for (const KeyValue<uint32_t, ShapeData> &E : shapes) {
+		r_owners->push_back(E.key);
 	}
 }
 
-Array CollisionObject2D::_get_shape_owners() {
-	Array ret;
-	for (Map<uint32_t, ShapeData>::Element *E = shapes.front(); E; E = E->next()) {
-		ret.push_back(E->key());
+PackedInt32Array CollisionObject2D::_get_shape_owners() {
+	PackedInt32Array ret;
+	for (const KeyValue<uint32_t, ShapeData> &E : shapes) {
+		ret.push_back(E.key);
 	}
 
 	return ret;
@@ -380,7 +416,7 @@ Transform2D CollisionObject2D::shape_owner_get_transform(uint32_t p_owner) const
 Object *CollisionObject2D::shape_owner_get_owner(uint32_t p_owner) const {
 	ERR_FAIL_COND_V(!shapes.has(p_owner), nullptr);
 
-	return shapes[p_owner].owner;
+	return ObjectDB::get_instance(shapes[p_owner].owner_id);
 }
 
 void CollisionObject2D::shape_owner_add_shape(uint32_t p_owner, const Ref<Shape2D> &p_shape) {
@@ -432,12 +468,12 @@ void CollisionObject2D::shape_owner_remove_shape(uint32_t p_owner, int p_shape) 
 		PhysicsServer2D::get_singleton()->body_remove_shape(rid, index_to_remove);
 	}
 
-	shapes[p_owner].shapes.remove(p_shape);
+	shapes[p_owner].shapes.remove_at(p_shape);
 
-	for (Map<uint32_t, ShapeData>::Element *E = shapes.front(); E; E = E->next()) {
-		for (int i = 0; i < E->get().shapes.size(); i++) {
-			if (E->get().shapes[i].index > index_to_remove) {
-				E->get().shapes.write[i].index -= 1;
+	for (KeyValue<uint32_t, ShapeData> &E : shapes) {
+		for (int i = 0; i < E.value.shapes.size(); i++) {
+			if (E.value.shapes[i].index > index_to_remove) {
+				E.value.shapes.write[i].index -= 1;
 			}
 		}
 	}
@@ -454,18 +490,18 @@ void CollisionObject2D::shape_owner_clear_shapes(uint32_t p_owner) {
 }
 
 uint32_t CollisionObject2D::shape_find_owner(int p_shape_index) const {
-	ERR_FAIL_INDEX_V(p_shape_index, total_subshapes, 0);
+	ERR_FAIL_INDEX_V(p_shape_index, total_subshapes, UINT32_MAX);
 
-	for (const Map<uint32_t, ShapeData>::Element *E = shapes.front(); E; E = E->next()) {
-		for (int i = 0; i < E->get().shapes.size(); i++) {
-			if (E->get().shapes[i].index == p_shape_index) {
-				return E->key();
+	for (const KeyValue<uint32_t, ShapeData> &E : shapes) {
+		for (int i = 0; i < E.value.shapes.size(); i++) {
+			if (E.value.shapes[i].index == p_shape_index) {
+				return E.key;
 			}
 		}
 	}
 
 	//in theory it should be unreachable
-	return 0;
+	ERR_FAIL_V_MSG(UINT32_MAX, "Can't find owner for shape index " + itos(p_shape_index) + ".");
 }
 
 void CollisionObject2D::set_pickable(bool p_enabled) {
@@ -487,30 +523,22 @@ void CollisionObject2D::_input_event_call(Viewport *p_viewport, const Ref<InputE
 }
 
 void CollisionObject2D::_mouse_enter() {
-	if (get_script_instance()) {
-		get_script_instance()->call(SceneStringNames::get_singleton()->_mouse_enter);
-	}
+	GDVIRTUAL_CALL(_mouse_enter);
 	emit_signal(SceneStringNames::get_singleton()->mouse_entered);
 }
 
 void CollisionObject2D::_mouse_exit() {
-	if (get_script_instance()) {
-		get_script_instance()->call(SceneStringNames::get_singleton()->_mouse_exit);
-	}
+	GDVIRTUAL_CALL(_mouse_exit);
 	emit_signal(SceneStringNames::get_singleton()->mouse_exited);
 }
 
 void CollisionObject2D::_mouse_shape_enter(int p_shape) {
-	if (get_script_instance()) {
-		get_script_instance()->call(SceneStringNames::get_singleton()->_mouse_shape_enter, p_shape);
-	}
+	GDVIRTUAL_CALL(_mouse_shape_enter, p_shape);
 	emit_signal(SceneStringNames::get_singleton()->mouse_shape_entered, p_shape);
 }
 
 void CollisionObject2D::_mouse_shape_exit(int p_shape) {
-	if (get_script_instance()) {
-		get_script_instance()->call(SceneStringNames::get_singleton()->_mouse_shape_exit, p_shape);
-	}
+	GDVIRTUAL_CALL(_mouse_shape_exit, p_shape);
 	emit_signal(SceneStringNames::get_singleton()->mouse_shape_exited, p_shape);
 }
 
@@ -538,6 +566,9 @@ void CollisionObject2D::set_body_mode(PhysicsServer2D::BodyMode p_mode) {
 	PhysicsServer2D::get_singleton()->body_set_mode(rid, p_mode);
 }
 
+void CollisionObject2D::_space_changed(const RID &p_new_space) {
+}
+
 void CollisionObject2D::_update_pickable() {
 	if (!is_inside_tree()) {
 		return;
@@ -551,11 +582,11 @@ void CollisionObject2D::_update_pickable() {
 	}
 }
 
-TypedArray<String> CollisionObject2D::get_configuration_warnings() const {
-	TypedArray<String> warnings = Node::get_configuration_warnings();
+Array CollisionObject2D::get_configuration_warnings() const {
+	Array warnings = Node::get_configuration_warnings();
 
 	if (shapes.is_empty()) {
-		warnings.push_back(TTR("This node has no shape, so it can't collide or interact with other objects.\nConsider adding a CollisionShape2D or CollisionPolygon2D as a child to define its shape."));
+		warnings.push_back(RTR("This node has no shape, so it can't collide or interact with other objects.\nConsider adding a CollisionShape2D or CollisionPolygon2D as a child to define its shape."));
 	}
 
 	return warnings;
@@ -571,6 +602,8 @@ void CollisionObject2D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_collision_layer_value", "layer_number"), &CollisionObject2D::get_collision_layer_value);
 	ClassDB::bind_method(D_METHOD("set_collision_mask_value", "layer_number", "value"), &CollisionObject2D::set_collision_mask_value);
 	ClassDB::bind_method(D_METHOD("get_collision_mask_value", "layer_number"), &CollisionObject2D::get_collision_mask_value);
+	ClassDB::bind_method(D_METHOD("set_collision_priority", "priority"), &CollisionObject2D::set_collision_priority);
+	ClassDB::bind_method(D_METHOD("get_collision_priority"), &CollisionObject2D::get_collision_priority);
 	ClassDB::bind_method(D_METHOD("set_disable_mode", "mode"), &CollisionObject2D::set_disable_mode);
 	ClassDB::bind_method(D_METHOD("get_disable_mode"), &CollisionObject2D::get_disable_mode);
 	ClassDB::bind_method(D_METHOD("set_pickable", "enabled"), &CollisionObject2D::set_pickable);
@@ -596,6 +629,10 @@ void CollisionObject2D::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("shape_find_owner", "shape_index"), &CollisionObject2D::shape_find_owner);
 
 	GDVIRTUAL_BIND(_input_event, "viewport", "event", "shape_idx");
+	GDVIRTUAL_BIND(_mouse_enter);
+	GDVIRTUAL_BIND(_mouse_exit);
+	GDVIRTUAL_BIND(_mouse_shape_enter, "shape_idx");
+	GDVIRTUAL_BIND(_mouse_shape_exit, "shape_idx");
 
 	ADD_SIGNAL(MethodInfo("input_event", PropertyInfo(Variant::OBJECT, "viewport", PROPERTY_HINT_RESOURCE_TYPE, "Node"), PropertyInfo(Variant::OBJECT, "event", PROPERTY_HINT_RESOURCE_TYPE, "InputEvent"), PropertyInfo(Variant::INT, "shape_idx")));
 	ADD_SIGNAL(MethodInfo("mouse_entered"));
@@ -603,11 +640,12 @@ void CollisionObject2D::_bind_methods() {
 	ADD_SIGNAL(MethodInfo("mouse_shape_entered", PropertyInfo(Variant::INT, "shape_idx")));
 	ADD_SIGNAL(MethodInfo("mouse_shape_exited", PropertyInfo(Variant::INT, "shape_idx")));
 
-	ADD_PROPERTY(PropertyInfo(Variant::INT, "disable_mode", PROPERTY_HINT_ENUM, "Remove,MakeStatic,KeepActive"), "set_disable_mode", "get_disable_mode");
+	ADD_PROPERTY(PropertyInfo(Variant::INT, "disable_mode", PROPERTY_HINT_ENUM, "Remove,Make Static,Keep Active"), "set_disable_mode", "get_disable_mode");
 
 	ADD_GROUP("Collision", "collision_");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "collision_layer", PROPERTY_HINT_LAYERS_2D_PHYSICS), "set_collision_layer", "get_collision_layer");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "collision_mask", PROPERTY_HINT_LAYERS_2D_PHYSICS), "set_collision_mask", "get_collision_mask");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "collision_priority"), "set_collision_priority", "get_collision_priority");
 
 	ADD_GROUP("Input", "input_");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "input_pickable"), "set_pickable", "is_pickable");
@@ -622,6 +660,7 @@ CollisionObject2D::CollisionObject2D(RID p_rid, bool p_area) {
 	area = p_area;
 	pickable = true;
 	set_notify_transform(true);
+	set_hide_clip_children(true);
 	total_subshapes = 0;
 	only_update_transform_changes = false;
 
@@ -640,5 +679,6 @@ CollisionObject2D::CollisionObject2D() {
 }
 
 CollisionObject2D::~CollisionObject2D() {
+	ERR_FAIL_NULL(PhysicsServer2D::get_singleton());
 	PhysicsServer2D::get_singleton()->free(rid);
 }

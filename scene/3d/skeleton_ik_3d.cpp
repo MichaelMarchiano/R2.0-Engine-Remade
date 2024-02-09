@@ -1,36 +1,32 @@
-/*************************************************************************/
-/*  skeleton_ik_3d.cpp                                                   */
-/*************************************************************************/
-/*                       This file is part of:                           */
-/*                           GODOT ENGINE                                */
-/*                      https://godotengine.org                          */
-/*************************************************************************/
-/* Copyright (c) 2007-2021 Juan Linietsky, Ariel Manzur.                 */
-/* Copyright (c) 2014-2021 Godot Engine contributors (cf. AUTHORS.md).   */
-/*                                                                       */
-/* Permission is hereby granted, free of charge, to any person obtaining */
-/* a copy of this software and associated documentation files (the       */
-/* "Software"), to deal in the Software without restriction, including   */
-/* without limitation the rights to use, copy, modify, merge, publish,   */
-/* distribute, sublicense, and/or sell copies of the Software, and to    */
-/* permit persons to whom the Software is furnished to do so, subject to */
-/* the following conditions:                                             */
-/*                                                                       */
-/* The above copyright notice and this permission notice shall be        */
-/* included in all copies or substantial portions of the Software.       */
-/*                                                                       */
-/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,       */
-/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF    */
-/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.*/
-/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY  */
-/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,  */
-/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE     */
-/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                */
-/*************************************************************************/
-
-/**
- * @author AndreaCatania
- */
+/**************************************************************************/
+/*  skeleton_ik_3d.cpp                                                    */
+/**************************************************************************/
+/*                         This file is part of:                          */
+/*                             GODOT ENGINE                               */
+/*                        https://godotengine.org                         */
+/**************************************************************************/
+/* Copyright (c) 2014-present Godot Engine contributors (see AUTHORS.md). */
+/* Copyright (c) 2007-2014 Juan Linietsky, Ariel Manzur.                  */
+/*                                                                        */
+/* Permission is hereby granted, free of charge, to any person obtaining  */
+/* a copy of this software and associated documentation files (the        */
+/* "Software"), to deal in the Software without restriction, including    */
+/* without limitation the rights to use, copy, modify, merge, publish,    */
+/* distribute, sublicense, and/or sell copies of the Software, and to     */
+/* permit persons to whom the Software is furnished to do so, subject to  */
+/* the following conditions:                                              */
+/*                                                                        */
+/* The above copyright notice and this permission notice shall be         */
+/* included in all copies or substantial portions of the Software.        */
+/*                                                                        */
+/* THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,        */
+/* EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF     */
+/* MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. */
+/* IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY   */
+/* CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,   */
+/* TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE      */
+/* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+/**************************************************************************/
 
 #include "skeleton_ik_3d.h"
 
@@ -99,7 +95,7 @@ bool FabrikInverseKinematic::build_chain(Task *p_task, bool p_force_simple_chain
 				child_ci->current_pos = child_ci->initial_transform.origin;
 
 				if (child_ci->parent_item) {
-					child_ci->length = (child_ci->current_pos - child_ci->parent_item->current_pos).length();
+					child_ci->length = child_ci->parent_item->current_pos.distance_to(child_ci->current_pos);
 				}
 			}
 
@@ -140,11 +136,11 @@ void FabrikInverseKinematic::solve_simple(Task *p_task, bool p_solve_magnet, Vec
 		solve_simple_backwards(p_task->chain, p_solve_magnet);
 		solve_simple_forwards(p_task->chain, p_solve_magnet, p_origin_pos);
 
-		distance_to_goal = (p_task->chain.tips[0].chain_item->current_pos - p_task->chain.tips[0].end_effector->goal_transform.origin).length();
+		distance_to_goal = p_task->chain.tips[0].end_effector->goal_transform.origin.distance_to(p_task->chain.tips[0].chain_item->current_pos);
 	}
 }
 
-void FabrikInverseKinematic::solve_simple_backwards(Chain &r_chain, bool p_solve_magnet) {
+void FabrikInverseKinematic::solve_simple_backwards(const Chain &r_chain, bool p_solve_magnet) {
 	if (p_solve_magnet && !r_chain.middle_chain_item) {
 		return;
 	}
@@ -291,14 +287,9 @@ void FabrikInverseKinematic::solve(Task *p_task, real_t blending_delta, bool ove
 		new_bone_pose.origin = ci->current_pos;
 
 		if (!ci->children.is_empty()) {
-			/// Rotate basis
-			const Vector3 initial_ori((ci->children[0].initial_transform.origin - ci->initial_transform.origin).normalized());
-			const Vector3 rot_axis(initial_ori.cross(ci->current_ori).normalized());
-
-			if (rot_axis[0] != 0 && rot_axis[1] != 0 && rot_axis[2] != 0) {
-				const real_t rot_angle(Math::acos(CLAMP(initial_ori.dot(ci->current_ori), -1, 1)));
-				new_bone_pose.basis.rotate(rot_axis, rot_angle);
-			}
+			Vector3 forward_vector = (ci->children[0].initial_transform.origin - ci->initial_transform.origin).normalized();
+			// Rotate the bone towards the next bone in the chain:
+			new_bone_pose.basis.rotate_to_align(forward_vector, new_bone_pose.origin.direction_to(ci->children[0].current_pos));
 
 		} else {
 			// Set target orientation to tip
@@ -337,8 +328,9 @@ void FabrikInverseKinematic::_update_chain(const Skeleton3D *p_sk, ChainItem *p_
 	}
 }
 
-void SkeletonIK3D::_validate_property(PropertyInfo &property) const {
-	if (property.name == "root_bone" || property.name == "tip_bone") {
+void SkeletonIK3D::_validate_property(PropertyInfo &p_property) const {
+	if (p_property.name == "root_bone" || p_property.name == "tip_bone") {
+		Skeleton3D *skeleton = get_parent_skeleton();
 		if (skeleton) {
 			String names("--,");
 			for (int i = 0; i < skeleton->get_bone_count(); i++) {
@@ -348,11 +340,11 @@ void SkeletonIK3D::_validate_property(PropertyInfo &property) const {
 				names += skeleton->get_bone_name(i);
 			}
 
-			property.hint = PROPERTY_HINT_ENUM;
-			property.hint_string = names;
+			p_property.hint = PROPERTY_HINT_ENUM;
+			p_property.hint_string = names;
 		} else {
-			property.hint = PROPERTY_HINT_NONE;
-			property.hint_string = "";
+			p_property.hint = PROPERTY_HINT_NONE;
+			p_property.hint_string = "";
 		}
 	}
 }
@@ -397,32 +389,32 @@ void SkeletonIK3D::_bind_methods() {
 	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "root_bone"), "set_root_bone", "get_root_bone");
 	ADD_PROPERTY(PropertyInfo(Variant::STRING_NAME, "tip_bone"), "set_tip_bone", "get_tip_bone");
 	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "interpolation", PROPERTY_HINT_RANGE, "0,1,0.001"), "set_interpolation", "get_interpolation");
-	ADD_PROPERTY(PropertyInfo(Variant::TRANSFORM3D, "target"), "set_target_transform", "get_target_transform");
+	ADD_PROPERTY(PropertyInfo(Variant::TRANSFORM3D, "target", PROPERTY_HINT_NONE, "suffix:m"), "set_target_transform", "get_target_transform");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "override_tip_basis"), "set_override_tip_basis", "is_override_tip_basis");
 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "use_magnet"), "set_use_magnet", "is_using_magnet");
-	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "magnet"), "set_magnet_position", "get_magnet_position");
+	ADD_PROPERTY(PropertyInfo(Variant::VECTOR3, "magnet", PROPERTY_HINT_NONE, "suffix:m"), "set_magnet_position", "get_magnet_position");
 	ADD_PROPERTY(PropertyInfo(Variant::NODE_PATH, "target_node"), "set_target_node", "get_target_node");
-	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_distance"), "set_min_distance", "get_min_distance");
+	ADD_PROPERTY(PropertyInfo(Variant::FLOAT, "min_distance", PROPERTY_HINT_NONE, "suffix:m"), "set_min_distance", "get_min_distance");
 	ADD_PROPERTY(PropertyInfo(Variant::INT, "max_iterations"), "set_max_iterations", "get_max_iterations");
 }
 
 void SkeletonIK3D::_notification(int p_what) {
 	switch (p_what) {
 		case NOTIFICATION_ENTER_TREE: {
-			skeleton = Object::cast_to<Skeleton3D>(get_parent());
+			skeleton_ref = Object::cast_to<Skeleton3D>(get_parent());
 			set_process_priority(1);
 			reload_chain();
 		} break;
+
 		case NOTIFICATION_INTERNAL_PROCESS: {
-			if (target_node_override) {
+			if (target_node_override_ref) {
 				reload_goal();
 			}
-
 			_solve_chain();
-
 		} break;
+
 		case NOTIFICATION_EXIT_TREE: {
-			reload_chain();
+			stop();
 		} break;
 	}
 }
@@ -472,7 +464,7 @@ const Transform3D &SkeletonIK3D::get_target_transform() const {
 
 void SkeletonIK3D::set_target_node(const NodePath &p_node) {
 	target_node_path_override = p_node;
-	target_node_override = nullptr;
+	target_node_override_ref = Variant();
 	reload_goal();
 }
 
@@ -512,6 +504,10 @@ void SkeletonIK3D::set_max_iterations(int p_iterations) {
 	max_iterations = p_iterations;
 }
 
+Skeleton3D *SkeletonIK3D::get_parent_skeleton() const {
+	return cast_to<Skeleton3D>(skeleton_ref.get_validated_object());
+}
+
 bool SkeletonIK3D::is_running() {
 	return is_processing_internal();
 }
@@ -520,7 +516,7 @@ void SkeletonIK3D::start(bool p_one_time) {
 	if (p_one_time) {
 		set_process_internal(false);
 
-		if (target_node_override) {
+		if (target_node_override_ref) {
 			reload_goal();
 		}
 
@@ -532,17 +528,19 @@ void SkeletonIK3D::start(bool p_one_time) {
 
 void SkeletonIK3D::stop() {
 	set_process_internal(false);
+	Skeleton3D *skeleton = get_parent_skeleton();
 	if (skeleton) {
 		skeleton->clear_bones_global_pose_override();
 	}
 }
 
 Transform3D SkeletonIK3D::_get_target_transform() {
-	if (!target_node_override && !target_node_path_override.is_empty()) {
-		target_node_override = Object::cast_to<Node3D>(get_node(target_node_path_override));
+	if (!target_node_override_ref && !target_node_path_override.is_empty()) {
+		target_node_override_ref = Object::cast_to<Node3D>(get_node(target_node_path_override));
 	}
 
-	if (target_node_override) {
+	Node3D *target_node_override = cast_to<Node3D>(target_node_override_ref.get_validated_object());
+	if (target_node_override && target_node_override->is_inside_tree()) {
 		return target_node_override->get_global_transform();
 	} else {
 		return target;
@@ -553,6 +551,7 @@ void SkeletonIK3D::reload_chain() {
 	FabrikInverseKinematic::free_task(task);
 	task = nullptr;
 
+	Skeleton3D *skeleton = get_parent_skeleton();
 	if (!skeleton) {
 		return;
 	}

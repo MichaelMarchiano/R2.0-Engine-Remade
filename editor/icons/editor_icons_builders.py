@@ -1,4 +1,5 @@
-"""Functions used to generate source files during build time
+"""
+Functions used to generate source files during build time
 
 All such functions are invoked in a subprocess on Windows to prevent build flakiness.
 
@@ -9,15 +10,14 @@ from io import StringIO
 from platform_methods import subprocess_main
 
 
+# See also `scene/theme/icons/default_theme_icons_builders.py`.
 def make_editor_icons_action(target, source, env):
-
     dst = target[0]
     svg_icons = source
 
     icons_string = StringIO()
 
     for f in svg_icons:
-
         fname = str(f)
 
         icons_string.write('\t"')
@@ -48,7 +48,6 @@ def make_editor_icons_action(target, source, env):
     thumb_big_indices = []
     index = 0
     for f in svg_icons:
-
         fname = str(f)
 
         # Trim the `.svg` extension from the string.
@@ -57,6 +56,8 @@ def make_editor_icons_action(target, source, env):
         if icon_name.endswith("MediumThumb"):  # don't know a better way to handle this
             thumb_medium_indices.append(str(index))
         if icon_name.endswith("BigThumb"):  # don't know a better way to handle this
+            thumb_big_indices.append(str(index))
+        if icon_name.endswith("GodotFile"):  # don't know a better way to handle this
             thumb_big_indices.append(str(index))
 
         s.write('\t"{0}"'.format(icon_name))

@@ -29,6 +29,7 @@ if env["builtin_mbedtls"]:
         "cipher_wrap.c",
         "cmac.c",
         "ctr_drbg.c",
+        "constant_time.c",
         "debug.c",
         "des.c",
         "dhm.c",
@@ -48,8 +49,9 @@ if env["builtin_mbedtls"]:
         "md4.c",
         "md5.c",
         "md.c",
-        "md_wrap.c",
         "memory_buffer_alloc.c",
+        "mps_reader.c",
+        "mps_trace.c",
         "net_sockets.c",
         "nist_kw.c",
         "oid.c",
@@ -75,9 +77,11 @@ if env["builtin_mbedtls"]:
         "ssl_ciphersuites.c",
         "ssl_cli.c",
         "ssl_cookie.c",
+        "ssl_msg.c",
         "ssl_srv.c",
         "ssl_ticket.c",
         "ssl_tls.c",
+        "ssl_tls13_keys.c",
         "threading.c",
         "timing.c",
         "version.c",
@@ -96,10 +100,14 @@ if env["builtin_mbedtls"]:
     thirdparty_sources = [thirdparty_dir + file for file in thirdparty_sources]
 
     env_mbed_tls.Prepend(CPPPATH=["#thirdparty/mbedtls/include/"])
+    env_mbed_tls.Append(
+        CPPDEFINES=[("MBEDTLS_CONFIG_FILE", '\\"thirdparty/mbedtls/include/godot_module_mbedtls_config.h\\"')]
+    )
 
     env_thirdparty = env_mbed_tls.Clone()
     env_thirdparty.disable_warnings()
     env_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
+    env_thirdparty.Depends(thirdparty_obj, "#thirdparty/mbedtls/include/godot_module_mbedtls_config.h")
     env.modules_sources += thirdparty_obj
 
 

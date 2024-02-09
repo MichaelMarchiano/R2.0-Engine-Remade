@@ -1,20 +1,28 @@
 import os
+import sys
 import re
 import glob
 import subprocess
 from collections import OrderedDict
+from collections.abc import Mapping
+from typing import Iterator
+from pathlib import Path
+from os.path import normpath, basename
 
-# We need to define our own `Action` method to control the verbosity of output
-# and whenever we need to run those commands in a subprocess on some platforms.
-from SCons import Node
-from SCons.Script import Action
-from SCons.Script import ARGUMENTS
-from SCons.Script import Glob
-from SCons.Variables.BoolVariable import _text2bool
-from platform_methods import run_in_subprocess
+# Get the "Godot" folder name ahead of time
+base_folder_path = str(os.path.abspath(Path(__file__).parent)) + "/"
+base_folder_only = os.path.basename(os.path.normpath(base_folder_path))
+# Listing all the folders we have converted
+# for SCU in scu_builders.py
+_scu_folders = set()
 
 
-def add_source_files(self, sources, files, warn_duplicates=True):
+def set_scu_folders(scu_folders):
+    global _scu_folders
+    _scu_folders = scu_folders
+
+
+def add_source_files_orig(self, sources, files, allow_gen=False):
     # Convert string to list of absolute paths (including expanding wildcard)
     if isinstance(files, (str, bytes)):
         # Keep SCons project-absolute path as they are (no wildcard support)
@@ -24,18 +32,84 @@ def add_source_files(self, sources, files, warn_duplicates=True):
                 return
             files = [files]
         else:
+            # Exclude .gen.cpp files from globbing, to avoid including obsolete ones.
+            # They should instead be added manually.
+            skip_gen_cpp = "*" in files
             dir_path = self.Dir(".").abspath
             files = sorted(glob.glob(dir_path + "/" + files))
+            if skip_gen_cpp and not allow_gen:
+                files = [f for f in files if not f.endswith(".gen.cpp")]
 
     # Add each path as compiled Object following environment (self) configuration
     for path in files:
         obj = self.Object(path)
         if obj in sources:
-            if warn_duplicates:
-                print('WARNING: Object "{}" already included in environment sources.'.format(obj))
-            else:
-                continue
+            print('WARNING: Object "{}" already included in environment sources.'.format(obj))
+            continue
         sources.append(obj)
+
+
+# The section name is used for checking
+# the hash table to see whether the folder
+# is included in the SCU build.
+# It will be something like "core/math".
+def _find_scu_section_name(subdir):
+    section_path = os.path.abspath(subdir) + "/"
+
+    folders = []
+    folder = ""
+
+    for i in range(8):
+        folder = os.path.dirname(section_path)
+        folder = os.path.basename(folder)
+        if folder == base_folder_only:
+            break
+        folders += [folder]
+        section_path += "../"
+        section_path = os.path.abspath(section_path) + "/"
+
+    section_name = ""
+    for n in range(len(folders)):
+        # section_name += folders[len(folders) - n - 1] + " "
+        section_name += folders[len(folders) - n - 1]
+        if n != (len(folders) - 1):
+            section_name += "/"
+
+    return section_name
+
+
+def add_source_files_scu(self, sources, files, allow_gen=False):
+    if self["scu_build"] and isinstance(files, str):
+        if "*." not in files:
+            return False
+
+        # If the files are in a subdirectory, we want to create the scu gen
+        # files inside this subdirectory.
+        subdir = os.path.dirname(files)
+        if subdir != "":
+            subdir += "/"
+
+        section_name = _find_scu_section_name(subdir)
+        # if the section name is in the hash table?
+        # i.e. is it part of the SCU build?
+        global _scu_folders
+        if section_name not in (_scu_folders):
+            return False
+
+        # Add all the gen.cpp files in the SCU directory
+        add_source_files_orig(self, sources, subdir + "scu/scu_*.gen.cpp", True)
+        return True
+    return False
+
+
+# Either builds the folder using the SCU system,
+# or reverts to regular build.
+def add_source_files(self, sources, files, allow_gen=False):
+    if not add_source_files_scu(self, sources, files, allow_gen):
+        # Wraps the original function when scu build is not active.
+        add_source_files_orig(self, sources, files, allow_gen)
+        return False
+    return True
 
 
 def disable_warnings(self):
@@ -43,60 +117,64 @@ def disable_warnings(self):
     if self.msvc:
         # We have to remove existing warning level defines before appending /w,
         # otherwise we get: "warning D9025 : overriding '/W3' with '/w'"
-        warn_flags = ["/Wall", "/W4", "/W3", "/W2", "/W1", "/WX"]
-        self.Append(CCFLAGS=["/w"])
-        self.Append(CFLAGS=["/w"])
-        self.Append(CXXFLAGS=["/w"])
-        self["CCFLAGS"] = [x for x in self["CCFLAGS"] if not x in warn_flags]
-        self["CFLAGS"] = [x for x in self["CFLAGS"] if not x in warn_flags]
-        self["CXXFLAGS"] = [x for x in self["CXXFLAGS"] if not x in warn_flags]
+        self["CCFLAGS"] = [x for x in self["CCFLAGS"] if not (x.startswith("/W") or x.startswith("/w"))]
+        self["CFLAGS"] = [x for x in self["CFLAGS"] if not (x.startswith("/W") or x.startswith("/w"))]
+        self["CXXFLAGS"] = [x for x in self["CXXFLAGS"] if not (x.startswith("/W") or x.startswith("/w"))]
+        self.AppendUnique(CCFLAGS=["/w"])
     else:
-        self.Append(CCFLAGS=["-w"])
-        self.Append(CFLAGS=["-w"])
-        self.Append(CXXFLAGS=["-w"])
+        self.AppendUnique(CCFLAGS=["-w"])
+
+
+def force_optimization_on_debug(self):
+    # 'self' is the environment
+    if self["target"] == "template_release":
+        return
+
+    if self.msvc:
+        # We have to remove existing optimization level defines before appending /O2,
+        # otherwise we get: "warning D9025 : overriding '/0d' with '/02'"
+        self["CCFLAGS"] = [x for x in self["CCFLAGS"] if not x.startswith("/O")]
+        self["CFLAGS"] = [x for x in self["CFLAGS"] if not x.startswith("/O")]
+        self["CXXFLAGS"] = [x for x in self["CXXFLAGS"] if not x.startswith("/O")]
+        self.AppendUnique(CCFLAGS=["/O2"])
+    else:
+        self.AppendUnique(CCFLAGS=["-O3"])
 
 
 def add_module_version_string(self, s):
     self.module_version_string += "." + s
 
 
-def update_version(module_version_string=""):
+def get_version_info(module_version_string="", silent=False):
     build_name = "custom_build"
     if os.getenv("BUILD_NAME") != None:
         build_name = str(os.getenv("BUILD_NAME"))
-        print("Using custom build name: " + build_name)
+        if not silent:
+            print(f"Using custom build name: '{build_name}'.")
 
     import version
 
-    # NOTE: It is safe to generate this file here, since this is still executed serially
-    f = open("core/version_generated.gen.h", "w")
-    f.write("/* THIS FILE IS GENERATED DO NOT EDIT */\n")
-    f.write("#ifndef VERSION_GENERATED_GEN_H\n")
-    f.write("#define VERSION_GENERATED_GEN_H\n")
-    f.write('#define VERSION_SHORT_NAME "' + str(version.short_name) + '"\n')
-    f.write('#define VERSION_NAME "' + str(version.name) + '"\n')
-    f.write("#define VERSION_MAJOR " + str(version.major) + "\n")
-    f.write("#define VERSION_MINOR " + str(version.minor) + "\n")
-    f.write("#define VERSION_PATCH " + str(version.patch) + "\n")
+    version_info = {
+        "short_name": str(version.short_name),
+        "name": str(version.name),
+        "major": int(version.major),
+        "minor": int(version.minor),
+        "patch": int(version.patch),
+        "status": str(version.status),
+        "build": str(build_name),
+        "module_config": str(version.module_config) + module_version_string,
+        "website": str(version.website),
+        "docs_branch": str(version.docs),
+    }
+
     # For dev snapshots (alpha, beta, RC, etc.) we do not commit status change to Git,
     # so this define provides a way to override it without having to modify the source.
-    godot_status = str(version.status)
     if os.getenv("GODOT_VERSION_STATUS") != None:
-        godot_status = str(os.getenv("GODOT_VERSION_STATUS"))
-        print("Using version status '{}', overriding the original '{}'.".format(godot_status, str(version.status)))
-    f.write('#define VERSION_STATUS "' + godot_status + '"\n')
-    f.write('#define VERSION_BUILD "' + str(build_name) + '"\n')
-    f.write('#define VERSION_MODULE_CONFIG "' + str(version.module_config) + module_version_string + '"\n')
-    f.write("#define VERSION_YEAR " + str(version.year) + "\n")
-    f.write('#define VERSION_WEBSITE "' + str(version.website) + '"\n')
-    f.write("#endif // VERSION_GENERATED_GEN_H\n")
-    f.close()
+        version_info["status"] = str(os.getenv("GODOT_VERSION_STATUS"))
+        if not silent:
+            print(f"Using version status '{version_info['status']}', overriding the original '{version.status}'.")
 
-    # NOTE: It is safe to generate this file here, since this is still executed serially
-    fhash = open("core/version_hash.gen.h", "w")
-    fhash.write("/* THIS FILE IS GENERATED DO NOT EDIT */\n")
-    fhash.write("#ifndef VERSION_HASH_GEN_H\n")
-    fhash.write("#define VERSION_HASH_GEN_H\n")
+    # Parse Git hash if we're in a Git repo.
     githash = ""
     gitfolder = ".git"
 
@@ -108,26 +186,79 @@ def update_version(module_version_string=""):
     if os.path.isfile(os.path.join(gitfolder, "HEAD")):
         head = open(os.path.join(gitfolder, "HEAD"), "r", encoding="utf8").readline().strip()
         if head.startswith("ref: "):
-            head = os.path.join(gitfolder, head[5:])
+            ref = head[5:]
+            # If this directory is a Git worktree instead of a root clone.
+            parts = gitfolder.split("/")
+            if len(parts) > 2 and parts[-2] == "worktrees":
+                gitfolder = "/".join(parts[0:-2])
+            head = os.path.join(gitfolder, ref)
+            packedrefs = os.path.join(gitfolder, "packed-refs")
             if os.path.isfile(head):
                 githash = open(head, "r").readline().strip()
+            elif os.path.isfile(packedrefs):
+                # Git may pack refs into a single file. This code searches .git/packed-refs file for the current ref's hash.
+                # https://mirrors.edge.kernel.org/pub/software/scm/git/docs/git-pack-refs.html
+                for line in open(packedrefs, "r").read().splitlines():
+                    if line.startswith("#"):
+                        continue
+                    (line_hash, line_ref) = line.split(" ")
+                    if ref == line_ref:
+                        githash = line_hash
+                        break
         else:
             githash = head
 
-    fhash.write('#define VERSION_HASH "' + githash + '"\n')
-    fhash.write("#endif // VERSION_HASH_GEN_H\n")
+    version_info["git_hash"] = githash
+
+    return version_info
+
+
+def generate_version_header(module_version_string=""):
+    version_info = get_version_info(module_version_string)
+
+    # NOTE: It is safe to generate these files here, since this is still executed serially.
+
+    f = open("core/version_generated.gen.h", "w")
+    f.write(
+        """/* THIS FILE IS GENERATED DO NOT EDIT */
+#ifndef VERSION_GENERATED_GEN_H
+#define VERSION_GENERATED_GEN_H
+#define VERSION_SHORT_NAME "{short_name}"
+#define VERSION_NAME "{name}"
+#define VERSION_MAJOR {major}
+#define VERSION_MINOR {minor}
+#define VERSION_PATCH {patch}
+#define VERSION_STATUS "{status}"
+#define VERSION_BUILD "{build}"
+#define VERSION_MODULE_CONFIG "{module_config}"
+#define VERSION_WEBSITE "{website}"
+#define VERSION_DOCS_BRANCH "{docs_branch}"
+#define VERSION_DOCS_URL "https://docs.godotengine.org/en/" VERSION_DOCS_BRANCH
+#endif // VERSION_GENERATED_GEN_H
+""".format(
+            **version_info
+        )
+    )
+    f.close()
+
+    fhash = open("core/version_hash.gen.cpp", "w")
+    fhash.write(
+        """/* THIS FILE IS GENERATED DO NOT EDIT */
+#include "core/version.h"
+const char *const VERSION_HASH = "{git_hash}";
+""".format(
+            **version_info
+        )
+    )
     fhash.close()
 
 
 def parse_cg_file(fname, uniforms, sizes, conditionals):
-
     fs = open(fname, "r")
     line = fs.readline()
 
     while line:
-
         if re.match(r"^\s*uniform", line):
-
             res = re.match(r"uniform ([\d\w]*) ([\d\w]*)")
             type = res.groups(1)
             name = res.groups(2)
@@ -156,6 +287,9 @@ def get_cmdline_bool(option, default):
     """We use `ARGUMENTS.get()` to check if options were manually overridden on the command line,
     and SCons' _text2bool helper to convert them to booleans, otherwise they're handled as strings.
     """
+    from SCons.Script import ARGUMENTS
+    from SCons.Variables.BoolVariable import _text2bool
+
     cmdline_val = ARGUMENTS.get(option)
     if cmdline_val is not None:
         return _text2bool(cmdline_val)
@@ -250,25 +384,19 @@ def write_disabled_classes(class_list):
 
 def write_modules(modules):
     includes_cpp = ""
-    preregister_cpp = ""
-    register_cpp = ""
-    unregister_cpp = ""
+    initialize_cpp = ""
+    uninitialize_cpp = ""
 
     for name, path in modules.items():
         try:
             with open(os.path.join(path, "register_types.h")):
                 includes_cpp += '#include "' + path + '/register_types.h"\n'
-                preregister_cpp += "#ifdef MODULE_" + name.upper() + "_ENABLED\n"
-                preregister_cpp += "#ifdef MODULE_" + name.upper() + "_HAS_PREREGISTER\n"
-                preregister_cpp += "\tpreregister_" + name + "_types();\n"
-                preregister_cpp += "#endif\n"
-                preregister_cpp += "#endif\n"
-                register_cpp += "#ifdef MODULE_" + name.upper() + "_ENABLED\n"
-                register_cpp += "\tregister_" + name + "_types();\n"
-                register_cpp += "#endif\n"
-                unregister_cpp += "#ifdef MODULE_" + name.upper() + "_ENABLED\n"
-                unregister_cpp += "\tunregister_" + name + "_types();\n"
-                unregister_cpp += "#endif\n"
+                initialize_cpp += "#ifdef MODULE_" + name.upper() + "_ENABLED\n"
+                initialize_cpp += "\tinitialize_" + name + "_module(p_level);\n"
+                initialize_cpp += "#endif\n"
+                uninitialize_cpp += "#ifdef MODULE_" + name.upper() + "_ENABLED\n"
+                uninitialize_cpp += "\tuninitialize_" + name + "_module(p_level);\n"
+                uninitialize_cpp += "#endif\n"
         except OSError:
             pass
 
@@ -280,22 +408,17 @@ def write_modules(modules):
 
 %s
 
-void preregister_module_types() {
+void initialize_modules(ModuleInitializationLevel p_level) {
 %s
 }
 
-void register_module_types() {
-%s
-}
-
-void unregister_module_types() {
+void uninitialize_modules(ModuleInitializationLevel p_level) {
 %s
 }
 """ % (
         includes_cpp,
-        preregister_cpp,
-        register_cpp,
-        unregister_cpp,
+        initialize_cpp,
+        uninitialize_cpp,
     )
 
     # NOTE: It is safe to generate this file here, since this is still executed serially
@@ -319,7 +442,20 @@ def disable_module(self):
     self.disabled_modules.append(self.current_module)
 
 
-def module_check_dependencies(self, module, dependencies, silent=False):
+def module_add_dependencies(self, module, dependencies, optional=False):
+    """
+    Adds dependencies for a given module.
+    Meant to be used in module `can_build` methods.
+    """
+    if module not in self.module_dependencies:
+        self.module_dependencies[module] = [[], []]
+    if optional:
+        self.module_dependencies[module][1].extend(dependencies)
+    else:
+        self.module_dependencies[module][0].extend(dependencies)
+
+
+def module_check_dependencies(self, module):
     """
     Checks if module dependencies are enabled for a given module,
     and prints a warning if they aren't.
@@ -327,25 +463,42 @@ def module_check_dependencies(self, module, dependencies, silent=False):
     Returns a boolean (True if dependencies are satisfied).
     """
     missing_deps = []
-    for dep in dependencies:
+    required_deps = self.module_dependencies[module][0] if module in self.module_dependencies else []
+    for dep in required_deps:
         opt = "module_{}_enabled".format(dep)
         if not opt in self or not self[opt]:
             missing_deps.append(dep)
 
     if missing_deps != []:
-        if not silent:
-            print(
-                "Disabling '{}' module as the following dependencies are not satisfied: {}".format(
-                    module, ", ".join(missing_deps)
-                )
+        print(
+            "Disabling '{}' module as the following dependencies are not satisfied: {}".format(
+                module, ", ".join(missing_deps)
             )
+        )
         return False
     else:
         return True
 
 
-def use_windows_spawn_fix(self, platform=None):
+def sort_module_list(env):
+    out = OrderedDict()
+    deps = {k: v[0] + list(filter(lambda x: x in env.module_list, v[1])) for k, v in env.module_dependencies.items()}
 
+    frontier = list(env.module_list.keys())
+    explored = []
+    while len(frontier):
+        cur = frontier.pop()
+        deps_list = deps[cur] if cur in deps else []
+        if len(deps_list) and any([d not in explored for d in deps_list]):
+            # Will explore later, after its dependencies
+            frontier.insert(0, cur)
+            continue
+        explored.append(cur)
+    for k in explored:
+        env.module_list.move_to_end(k)
+
+
+def use_windows_spawn_fix(self, platform=None):
     if os.name != "nt":
         return  # not needed, only for windows
 
@@ -360,18 +513,19 @@ def use_windows_spawn_fix(self, platform=None):
     self.Replace(ARFLAGS="q")
 
     def mySubProcess(cmdline, env):
-
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        proc = subprocess.Popen(
-            cmdline,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            startupinfo=startupinfo,
-            shell=False,
-            env=env,
-        )
+        popen_args = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "startupinfo": startupinfo,
+            "shell": False,
+            "env": env,
+        }
+        if sys.version_info >= (3, 7, 0):
+            popen_args["text"] = True
+        proc = subprocess.Popen(cmdline, **popen_args)
         _, err = proc.communicate()
         rv = proc.wait()
         if rv:
@@ -381,7 +535,6 @@ def use_windows_spawn_fix(self, platform=None):
         return rv
 
     def mySpawn(sh, escape, cmd, args, env):
-
         newargs = " ".join(args[1:])
         cmdline = cmd + " " + newargs
 
@@ -401,80 +554,45 @@ def use_windows_spawn_fix(self, platform=None):
     self["SPAWN"] = mySpawn
 
 
-def save_active_platforms(apnames, ap):
-
-    for x in ap:
-        names = ["logo"]
-        if os.path.isfile(x + "/run_icon.png"):
-            names.append("run_icon")
-
-        for name in names:
-            pngf = open(x + "/" + name + ".png", "rb")
-            b = pngf.read(1)
-            str = " /* AUTOGENERATED FILE, DO NOT EDIT */ \n"
-            str += " static const unsigned char _" + x[9:] + "_" + name + "[]={"
-            while len(b) == 1:
-                str += hex(ord(b))
-                b = pngf.read(1)
-                if len(b) == 1:
-                    str += ","
-
-            str += "};\n"
-
-            pngf.close()
-
-            # NOTE: It is safe to generate this file here, since this is still executed serially
-            wf = x + "/" + name + ".gen.h"
-            with open(wf, "w") as pngw:
-                pngw.write(str)
-
-
 def no_verbose(sys, env):
-
     colors = {}
 
     # Colors are disabled in non-TTY environments such as pipes. This means
     # that if output is redirected to a file, it will not contain color codes
     if sys.stdout.isatty():
-        colors["cyan"] = "\033[96m"
-        colors["purple"] = "\033[95m"
-        colors["blue"] = "\033[94m"
-        colors["green"] = "\033[92m"
-        colors["yellow"] = "\033[93m"
-        colors["red"] = "\033[91m"
-        colors["end"] = "\033[0m"
+        colors["blue"] = "\033[0;94m"
+        colors["bold_blue"] = "\033[1;94m"
+        colors["reset"] = "\033[0m"
     else:
-        colors["cyan"] = ""
-        colors["purple"] = ""
         colors["blue"] = ""
-        colors["green"] = ""
-        colors["yellow"] = ""
-        colors["red"] = ""
-        colors["end"] = ""
+        colors["bold_blue"] = ""
+        colors["reset"] = ""
 
-    compile_source_message = "{}Compiling {}==> {}$SOURCE{}".format(
-        colors["blue"], colors["purple"], colors["yellow"], colors["end"]
+    # There is a space before "..." to ensure that source file names can be
+    # Ctrl + clicked in the VS Code terminal.
+    compile_source_message = "{}Compiling {}$SOURCE{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
-    java_compile_source_message = "{}Compiling {}==> {}$SOURCE{}".format(
-        colors["blue"], colors["purple"], colors["yellow"], colors["end"]
+    java_compile_source_message = "{}Compiling {}$SOURCE{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
-    compile_shared_source_message = "{}Compiling shared {}==> {}$SOURCE{}".format(
-        colors["blue"], colors["purple"], colors["yellow"], colors["end"]
+    compile_shared_source_message = "{}Compiling shared {}$SOURCE{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
-    link_program_message = "{}Linking Program        {}==> {}$TARGET{}".format(
-        colors["red"], colors["purple"], colors["yellow"], colors["end"]
+    link_program_message = "{}Linking Program {}$TARGET{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
-    link_library_message = "{}Linking Static Library {}==> {}$TARGET{}".format(
-        colors["red"], colors["purple"], colors["yellow"], colors["end"]
+    link_library_message = "{}Linking Static Library {}$TARGET{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
-    ranlib_library_message = "{}Ranlib Library         {}==> {}$TARGET{}".format(
-        colors["red"], colors["purple"], colors["yellow"], colors["end"]
+    ranlib_library_message = "{}Ranlib Library {}$TARGET{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
-    link_shared_library_message = "{}Linking Shared Library {}==> {}$TARGET{}".format(
-        colors["red"], colors["purple"], colors["yellow"], colors["end"]
+    link_shared_library_message = "{}Linking Shared Library {}$TARGET{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
-    java_library_message = "{}Creating Java Archive  {}==> {}$TARGET{}".format(
-        colors["red"], colors["purple"], colors["yellow"], colors["end"]
+    java_library_message = "{}Creating Java Archive {}$TARGET{} ...{}".format(
+        colors["blue"], colors["bold_blue"], colors["blue"], colors["reset"]
     )
 
     env.Append(CXXCOMSTR=[compile_source_message])
@@ -496,7 +614,7 @@ def detect_visual_c_compiler_version(tools_env):
     # and not scons setup environment (env)... so make sure you call the right environment on it or it will fail to detect
     # the proper vc version that will be called
 
-    # There is no flag to give to visual c compilers to set the architecture, i.e. scons bits argument (32,64,ARM etc)
+    # There is no flag to give to visual c compilers to set the architecture, i.e. scons arch argument (x86_32, x86_64, arm64, etc.).
     # There are many different cl.exe files that are run, and each one compiles & links to a different architecture
     # As far as I know, the only way to figure out what compiler will be run when Scons calls cl.exe via Program()
     # is to check the PATH variable and figure out which one will be called first. Code below does that and returns:
@@ -550,7 +668,6 @@ def detect_visual_c_compiler_version(tools_env):
 
     # and for VS 2017 and newer we check VCTOOLSINSTALLDIR:
     if "VCTOOLSINSTALLDIR" in tools_env:
-
         # Newer versions have a different path available
         vc_amd64_compiler_detection_index = (
             tools_env["PATH"].upper().find(tools_env["VCTOOLSINSTALLDIR"].upper() + "BIN\\HOSTX64\\X64;")
@@ -583,18 +700,34 @@ def detect_visual_c_compiler_version(tools_env):
         if vc_x86_amd64_compiler_detection_index > -1 and (
             vc_chosen_compiler_index == -1 or vc_chosen_compiler_index > vc_x86_amd64_compiler_detection_index
         ):
-            vc_chosen_compiler_index = vc_x86_amd64_compiler_detection_index
             vc_chosen_compiler_str = "x86_amd64"
 
     return vc_chosen_compiler_str
 
 
 def find_visual_c_batch_file(env):
-    from SCons.Tool.MSCommon.vc import get_default_version, get_host_target, find_batch_file
+    from SCons.Tool.MSCommon.vc import get_default_version, get_host_target, find_batch_file, find_vc_pdir
 
-    version = get_default_version(env)
-    (host_platform, target_platform, _) = get_host_target(env)
-    return find_batch_file(env, version, host_platform, target_platform)[0]
+    # Syntax changed in SCons 4.4.0.
+    from SCons import __version__ as scons_raw_version
+
+    scons_ver = env._get_major_minor_revision(scons_raw_version)
+
+    msvc_version = get_default_version(env)
+
+    if scons_ver >= (4, 4, 0):
+        (host_platform, target_platform, _) = get_host_target(env, msvc_version)
+    else:
+        (host_platform, target_platform, _) = get_host_target(env)
+
+    if scons_ver < (4, 6, 0):
+        return find_batch_file(env, msvc_version, host_platform, target_platform)[0]
+
+    # Scons 4.6.0+ removed passing env, so we need to get the product_dir ourselves first,
+    # then pass that as the last param instead of env as the first param as before.
+    # We should investigate if we can avoid relying on SCons internals here.
+    product_dir = find_vc_pdir(env, msvc_version)
+    return find_batch_file(msvc_version, host_platform, target_platform, product_dir)[0]
 
 
 def generate_cpp_hint_file(filename):
@@ -610,6 +743,9 @@ def generate_cpp_hint_file(filename):
 
 
 def glob_recursive(pattern, node="."):
+    from SCons import Node
+    from SCons.Script import Glob
+
     results = []
     for f in Glob(str(node) + "/*", source=True):
         if type(f) is Node.FS.Dir:
@@ -636,85 +772,6 @@ def add_to_vs_project(env, sources):
                 env.vs_srcs += [basename + ".c"]
             elif os.path.isfile(basename + ".cpp"):
                 env.vs_srcs += [basename + ".cpp"]
-
-
-def generate_vs_project(env, num_jobs):
-    batch_file = find_visual_c_batch_file(env)
-    if batch_file:
-
-        def build_commandline(commands):
-            common_build_prefix = [
-                'cmd /V /C set "plat=$(PlatformTarget)"',
-                '(if "$(PlatformTarget)"=="x64" (set "plat=x86_amd64"))',
-                'set "tools=%s"' % env["tools"],
-                '(if "$(Configuration)"=="release" (set "tools=no"))',
-                'call "' + batch_file + '" !plat!',
-            ]
-
-            # Windows allows us to have spaces in paths, so we need
-            # to double quote off the directory. However, the path ends
-            # in a backslash, so we need to remove this, lest it escape the
-            # last double quote off, confusing MSBuild
-            common_build_postfix = [
-                "--directory=\"$(ProjectDir.TrimEnd('\\'))\"",
-                "platform=windows",
-                "target=$(Configuration)",
-                "progress=no",
-                "tools=!tools!",
-                "-j%s" % num_jobs,
-            ]
-
-            if env["tests"]:
-                common_build_postfix.append("tests=yes")
-
-            if env["custom_modules"]:
-                common_build_postfix.append("custom_modules=%s" % env["custom_modules"])
-
-            result = " ^& ".join(common_build_prefix + [" ".join([commands] + common_build_postfix)])
-            return result
-
-        add_to_vs_project(env, env.core_sources)
-        add_to_vs_project(env, env.drivers_sources)
-        add_to_vs_project(env, env.main_sources)
-        add_to_vs_project(env, env.modules_sources)
-        add_to_vs_project(env, env.scene_sources)
-        add_to_vs_project(env, env.servers_sources)
-        if env["tests"]:
-            add_to_vs_project(env, env.tests_sources)
-        add_to_vs_project(env, env.editor_sources)
-
-        for header in glob_recursive("**/*.h"):
-            env.vs_incs.append(str(header))
-
-        env["MSVSBUILDCOM"] = build_commandline("scons")
-        env["MSVSREBUILDCOM"] = build_commandline("scons vsproj=yes")
-        env["MSVSCLEANCOM"] = build_commandline("scons --clean")
-
-        # This version information (Win32, x64, Debug, Release, Release_Debug seems to be
-        # required for Visual Studio to understand that it needs to generate an NMAKE
-        # project. Do not modify without knowing what you are doing.
-        debug_variants = ["debug|Win32"] + ["debug|x64"]
-        release_variants = ["release|Win32"] + ["release|x64"]
-        release_debug_variants = ["release_debug|Win32"] + ["release_debug|x64"]
-        variants = debug_variants + release_variants + release_debug_variants
-        debug_targets = ["bin\\godot.windows.tools.32.exe"] + ["bin\\godot.windows.tools.64.exe"]
-        release_targets = ["bin\\godot.windows.opt.32.exe"] + ["bin\\godot.windows.opt.64.exe"]
-        release_debug_targets = ["bin\\godot.windows.opt.tools.32.exe"] + ["bin\\godot.windows.opt.tools.64.exe"]
-        targets = debug_targets + release_targets + release_debug_targets
-        if not env.get("MSVS"):
-            env["MSVS"]["PROJECTSUFFIX"] = ".vcxproj"
-            env["MSVS"]["SOLUTIONSUFFIX"] = ".sln"
-        env.MSVSProject(
-            target=["#godot" + env["MSVSPROJECTSUFFIX"]],
-            incs=env.vs_incs,
-            srcs=env.vs_srcs,
-            runfile=targets,
-            buildtarget=targets,
-            auto_build_solution=1,
-            variant=variants,
-        )
-    else:
-        print("Could not locate Visual Studio batch file to set up the build environment. Not generating VS project.")
 
 
 def precious_program(env, program, sources, **args):
@@ -748,6 +805,9 @@ def CommandNoCache(env, target, sources, command, **args):
 
 
 def Run(env, function, short_message, subprocess=True):
+    from SCons.Script import Action
+    from platform_methods import run_in_subprocess
+
     output_print = short_message if not env["verbose"] else ""
     if not subprocess:
         return Action(function, output_print)
@@ -757,15 +817,15 @@ def Run(env, function, short_message, subprocess=True):
 
 def detect_darwin_sdk_path(platform, env):
     sdk_name = ""
-    if platform == "osx":
+    if platform == "macos":
         sdk_name = "macosx"
         var_name = "MACOS_SDK_PATH"
-    elif platform == "iphone":
+    elif platform == "ios":
         sdk_name = "iphoneos"
-        var_name = "IPHONESDK"
-    elif platform == "iphonesimulator":
+        var_name = "IOS_SDK_PATH"
+    elif platform == "iossimulator":
         sdk_name = "iphonesimulator"
-        var_name = "IPHONESDK"
+        var_name = "IOS_SDK_PATH"
     else:
         raise Exception("Invalid platform argument passed to detect_darwin_sdk_path")
 
@@ -792,9 +852,26 @@ def is_vanilla_clang(env):
 
 def get_compiler_version(env):
     """
-    Returns an array of version numbers as ints: [major, minor, patch].
-    The return array should have at least two values (major, minor).
+    Returns a dictionary with various version information:
+
+    - major, minor, patch: Version following semantic versioning system
+    - metadata1, metadata2: Extra information
+    - date: Date of the build
     """
+    ret = {
+        "major": -1,
+        "minor": -1,
+        "patch": -1,
+        "metadata1": None,
+        "metadata2": None,
+        "date": None,
+        "apple_major": -1,
+        "apple_minor": -1,
+        "apple_patch1": -1,
+        "apple_patch2": -1,
+        "apple_patch3": -1,
+    }
+
     if not env.msvc:
         # Not using -dumpversion as some GCC distros only return major, and
         # Clang used to return hardcoded 4.2.1: # https://reviews.llvm.org/D56803
@@ -802,23 +879,52 @@ def get_compiler_version(env):
             version = subprocess.check_output([env.subst(env["CXX"]), "--version"]).strip().decode("utf-8")
         except (subprocess.CalledProcessError, OSError):
             print("Couldn't parse CXX environment variable to infer compiler version.")
-            return None
-    else:  # TODO: Implement for MSVC
-        return None
+            return ret
+    else:
+        # TODO: Implement for MSVC
+        return ret
     match = re.search(
-        "(?:(?<=version )|(?<=\) )|(?<=^))"
-        "(?P<major>\d+)"
-        "(?:\.(?P<minor>\d*))?"
-        "(?:\.(?P<patch>\d*))?"
-        "(?:-(?P<metadata1>[0-9a-zA-Z-]*))?"
-        "(?:\+(?P<metadata2>[0-9a-zA-Z-]*))?"
-        "(?: (?P<date>[0-9]{8}|[0-9]{6})(?![0-9a-zA-Z]))?",
+        r"(?:(?<=version )|(?<=\) )|(?<=^))"
+        r"(?P<major>\d+)"
+        r"(?:\.(?P<minor>\d*))?"
+        r"(?:\.(?P<patch>\d*))?"
+        r"(?:-(?P<metadata1>[0-9a-zA-Z-]*))?"
+        r"(?:\+(?P<metadata2>[0-9a-zA-Z-]*))?"
+        r"(?: (?P<date>[0-9]{8}|[0-9]{6})(?![0-9a-zA-Z]))?",
         version,
     )
     if match is not None:
-        return match.groupdict()
-    else:
-        return None
+        for key, value in match.groupdict().items():
+            if value is not None:
+                ret[key] = value
+
+    match_apple = re.search(
+        r"(?:(?<=clang-)|(?<=\) )|(?<=^))"
+        r"(?P<apple_major>\d+)"
+        r"(?:\.(?P<apple_minor>\d*))?"
+        r"(?:\.(?P<apple_patch1>\d*))?"
+        r"(?:\.(?P<apple_patch2>\d*))?"
+        r"(?:\.(?P<apple_patch3>\d*))?",
+        version,
+    )
+    if match_apple is not None:
+        for key, value in match_apple.groupdict().items():
+            if value is not None:
+                ret[key] = value
+
+    # Transform semantic versioning to integers
+    for key in [
+        "major",
+        "minor",
+        "patch",
+        "apple_major",
+        "apple_minor",
+        "apple_patch1",
+        "apple_patch2",
+        "apple_patch3",
+    ]:
+        ret[key] = int(ret[key] or -1)
+    return ret
 
 
 def using_gcc(env):
@@ -968,3 +1074,456 @@ def dump(env):
 
     with open(".scons_env.json", "w") as f:
         dump(env.Dictionary(), f, indent=4, default=non_serializable)
+
+
+# Custom Visual Studio project generation logic that supports any platform that has a msvs.py
+# script, so Visual Studio can be used to run scons for any platform, with the right defines per target.
+# Invoked with scons vsproj=yes
+#
+# Only platforms that opt in to vs proj generation by having a msvs.py file in the platform folder are included.
+# Platforms with a msvs.py file will be added to the solution, but only the current active platform+target+arch
+# will have a build configuration generated, because we only know what the right defines/includes/flags/etc are
+# on the active build target.
+#
+# Platforms that don't support an editor target will have a dummy editor target that won't do anything on build,
+# but will have the files and configuration for the windows editor target.
+#
+# To generate build configuration files for all platforms+targets+arch combinations, users can call
+#   scons vsproj=yes
+# for each combination of platform+target+arch. This will generate the relevant vs project files but
+# skip the build process. This lets project files be quickly generated even if there are build errors.
+#
+# To generate AND build from the command line:
+#   scons vsproj=yes vsproj_gen_only=yes
+def generate_vs_project(env, original_args, project_name="godot"):
+    # Augmented glob_recursive that also fills the dirs argument with traversed directories that have content.
+    def glob_recursive_2(pattern, dirs, node="."):
+        from SCons import Node
+        from SCons.Script import Glob
+
+        results = []
+        for f in Glob(str(node) + "/*", source=True):
+            if type(f) is Node.FS.Dir:
+                results += glob_recursive_2(pattern, dirs, f)
+        r = Glob(str(node) + "/" + pattern, source=True)
+        if len(r) > 0 and not str(node) in dirs:
+            d = ""
+            for part in str(node).split("\\"):
+                d += part
+                if not d in dirs:
+                    dirs.append(d)
+                d += "\\"
+        results += r
+        return results
+
+    def get_bool(args, option, default):
+        from SCons.Variables.BoolVariable import _text2bool
+
+        val = args.get(option, default)
+        if val is not None:
+            try:
+                return _text2bool(val)
+            except:
+                return default
+        else:
+            return default
+
+    def format_key_value(v):
+        if type(v) in [tuple, list]:
+            return v[0] if len(v) == 1 else f"{v[0]}={v[1]}"
+        return v
+
+    filtered_args = original_args.copy()
+
+    # Ignore the "vsproj" option to not regenerate the VS project on every build
+    filtered_args.pop("vsproj", None)
+
+    # This flag allows users to regenerate the proj files but skip the building process.
+    # This lets projects be regenerated even if there are build errors.
+    filtered_args.pop("vsproj_gen_only", None)
+
+    # The "progress" option is ignored as the current compilation progress indication doesn't work in VS
+    filtered_args.pop("progress", None)
+
+    # We add these three manually because they might not be explicitly passed in, and it's important to always set them.
+    filtered_args.pop("platform", None)
+    filtered_args.pop("target", None)
+    filtered_args.pop("arch", None)
+
+    platform = env["platform"]
+    target = env["target"]
+    arch = env["arch"]
+
+    vs_configuration = {}
+    common_build_prefix = []
+    confs = []
+    for x in sorted(glob.glob("platform/*")):
+        # Only platforms that opt in to vs proj generation are included.
+        if not os.path.isdir(x) or not os.path.exists(x + "/msvs.py"):
+            continue
+        tmppath = "./" + x
+        sys.path.insert(0, tmppath)
+        import msvs
+
+        vs_plats = []
+        vs_confs = []
+        try:
+            platform_name = x[9:]
+            vs_plats = msvs.get_platforms()
+            vs_confs = msvs.get_configurations()
+            val = []
+            for plat in vs_plats:
+                val += [{"platform": plat[0], "architecture": plat[1]}]
+
+            vsconf = {"platform": platform_name, "targets": vs_confs, "arches": val}
+            confs += [vsconf]
+
+            # Save additional information about the configuration for the actively selected platform,
+            # so we can generate the platform-specific props file with all the build commands/defines/etc
+            if platform == platform_name:
+                common_build_prefix = msvs.get_build_prefix(env)
+                vs_configuration = vsconf
+        except Exception:
+            pass
+
+        sys.path.remove(tmppath)
+        sys.modules.pop("msvs")
+
+    headers = []
+    headers_dirs = []
+    for file in glob_recursive_2("*.h", headers_dirs):
+        headers.append(str(file).replace("/", "\\"))
+    for file in glob_recursive_2("*.hpp", headers_dirs):
+        headers.append(str(file).replace("/", "\\"))
+
+    sources = []
+    sources_dirs = []
+    for file in glob_recursive_2("*.cpp", sources_dirs):
+        sources.append(str(file).replace("/", "\\"))
+    for file in glob_recursive_2("*.c", sources_dirs):
+        sources.append(str(file).replace("/", "\\"))
+
+    others = []
+    others_dirs = []
+    for file in glob_recursive_2("*.natvis", others_dirs):
+        others.append(str(file).replace("/", "\\"))
+    for file in glob_recursive_2("*.glsl", others_dirs):
+        others.append(str(file).replace("/", "\\"))
+
+    skip_filters = False
+    import hashlib
+    import json
+
+    md5 = hashlib.md5(
+        json.dumps(headers + headers_dirs + sources + sources_dirs + others + others_dirs, sort_keys=True).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+    if os.path.exists(f"{project_name}.vcxproj.filters"):
+        existing_filters = open(f"{project_name}.vcxproj.filters", "r").read()
+        match = re.search(r"(?ms)^<!-- CHECKSUM$.([0-9a-f]{32})", existing_filters)
+        if match is not None and md5 == match.group(1):
+            skip_filters = True
+
+    import uuid
+
+    # Don't regenerate the filters file if nothing has changed, so we keep the existing UUIDs.
+    if not skip_filters:
+        print(f"Regenerating {project_name}.vcxproj.filters")
+
+        filters_template = open("misc/msvs/vcxproj.filters.template", "r").read()
+        for i in range(1, 10):
+            filters_template = filters_template.replace(f"%%UUID{i}%%", str(uuid.uuid4()))
+
+        filters = ""
+
+        for d in headers_dirs:
+            filters += f'<Filter Include="Header Files\\{d}"><UniqueIdentifier>{{{str(uuid.uuid4())}}}</UniqueIdentifier></Filter>\n'
+        for d in sources_dirs:
+            filters += f'<Filter Include="Source Files\\{d}"><UniqueIdentifier>{{{str(uuid.uuid4())}}}</UniqueIdentifier></Filter>\n'
+        for d in others_dirs:
+            filters += f'<Filter Include="Other Files\\{d}"><UniqueIdentifier>{{{str(uuid.uuid4())}}}</UniqueIdentifier></Filter>\n'
+
+        filters_template = filters_template.replace("%%FILTERS%%", filters)
+
+        filters = ""
+        for file in headers:
+            filters += (
+                f'<ClInclude Include="{file}"><Filter>Header Files\\{os.path.dirname(file)}</Filter></ClInclude>\n'
+            )
+        filters_template = filters_template.replace("%%INCLUDES%%", filters)
+
+        filters = ""
+        for file in sources:
+            filters += (
+                f'<ClCompile Include="{file}"><Filter>Source Files\\{os.path.dirname(file)}</Filter></ClCompile>\n'
+            )
+
+        filters_template = filters_template.replace("%%COMPILES%%", filters)
+
+        filters = ""
+        for file in others:
+            filters += f'<None Include="{file}"><Filter>Other Files\\{os.path.dirname(file)}</Filter></None>\n'
+        filters_template = filters_template.replace("%%OTHERS%%", filters)
+
+        filters_template = filters_template.replace("%%HASH%%", md5)
+
+        with open(f"{project_name}.vcxproj.filters", "w") as f:
+            f.write(filters_template)
+
+    envsources = []
+
+    envsources += env.core_sources
+    envsources += env.drivers_sources
+    envsources += env.main_sources
+    envsources += env.modules_sources
+    envsources += env.scene_sources
+    envsources += env.servers_sources
+    if env.editor_build:
+        envsources += env.editor_sources
+    envsources += env.platform_sources
+
+    headers_active = []
+    sources_active = []
+    others_active = []
+    for x in envsources:
+        fname = ""
+        if type(x) == type(""):
+            fname = env.File(x).path
+        else:
+            # Some object files might get added directly as a File object and not a list.
+            try:
+                fname = env.File(x)[0].path
+            except:
+                fname = x.path
+                pass
+
+        if fname:
+            fname = fname.replace("\\\\", "/")
+            parts = os.path.splitext(fname)
+            basename = parts[0]
+            ext = parts[1]
+            idx = fname.find(env["OBJSUFFIX"])
+            if ext in [".h", ".hpp"]:
+                headers_active += [fname]
+            elif ext in [".c", ".cpp"]:
+                sources_active += [fname]
+            elif idx > 0:
+                basename = fname[:idx]
+                if os.path.isfile(basename + ".h"):
+                    headers_active += [basename + ".h"]
+                elif os.path.isfile(basename + ".hpp"):
+                    headers_active += [basename + ".hpp"]
+                elif basename.endswith(".gen") and os.path.isfile(basename[:-4] + ".h"):
+                    headers_active += [basename[:-4] + ".h"]
+                if os.path.isfile(basename + ".c"):
+                    sources_active += [basename + ".c"]
+                elif os.path.isfile(basename + ".cpp"):
+                    sources_active += [basename + ".cpp"]
+            else:
+                fname = os.path.relpath(os.path.abspath(fname), env.Dir("").abspath)
+                others_active += [fname]
+
+    all_items = []
+    properties = []
+    activeItems = []
+    extraItems = []
+
+    set_headers = set(headers_active)
+    set_sources = set(sources_active)
+    set_others = set(others_active)
+    for file in headers:
+        all_items.append(f'<ClInclude Include="{file}">')
+        all_items.append(
+            f"  <ExcludedFromBuild Condition=\"!$(ActiveProjectItemList.Contains(';{file};'))\">true</ExcludedFromBuild>"
+        )
+        all_items.append("</ClInclude>")
+        if file in set_headers:
+            activeItems.append(file)
+
+    for file in sources:
+        all_items.append(f'<ClCompile Include="{file}">')
+        all_items.append(
+            f"  <ExcludedFromBuild Condition=\"!$(ActiveProjectItemList.Contains(';{file};'))\">true</ExcludedFromBuild>"
+        )
+        all_items.append("</ClCompile>")
+        if file in set_sources:
+            activeItems.append(file)
+
+    for file in others:
+        all_items.append(f'<None Include="{file}">')
+        all_items.append(
+            f"  <ExcludedFromBuild Condition=\"!$(ActiveProjectItemList.Contains(';{file};'))\">true</ExcludedFromBuild>"
+        )
+        all_items.append("</None>")
+        if file in set_others:
+            activeItems.append(file)
+
+    if vs_configuration:
+        vsconf = ""
+        for a in vs_configuration["arches"]:
+            if arch == a["architecture"]:
+                vsconf = f'{target}|{a["platform"]}'
+                break
+
+        condition = "'$(Configuration)|$(Platform)'=='" + vsconf + "'"
+        properties.append("<ActiveProjectItemList>;" + ";".join(activeItems) + ";</ActiveProjectItemList>")
+        output = f'bin\\godot{env["PROGSUFFIX"]}'
+
+        props_template = open("misc/msvs/props.template", "r").read()
+
+        props_template = props_template.replace("%%VSCONF%%", vsconf)
+        props_template = props_template.replace("%%CONDITION%%", condition)
+        props_template = props_template.replace("%%PROPERTIES%%", "\n    ".join(properties))
+        props_template = props_template.replace("%%EXTRA_ITEMS%%", "\n    ".join(extraItems))
+
+        props_template = props_template.replace("%%OUTPUT%%", output)
+
+        props_template = props_template.replace(
+            "%%DEFINES%%", ";".join([format_key_value(v) for v in list(env["CPPDEFINES"])])
+        )
+        props_template = props_template.replace("%%INCLUDES%%", ";".join([str(j) for j in env["CPPPATH"]]))
+        props_template = props_template.replace(
+            "%%OPTIONS%%",
+            " ".join(env["CCFLAGS"]) + " " + " ".join([x for x in env["CXXFLAGS"] if not x.startswith("$")]),
+        )
+
+        # Windows allows us to have spaces in paths, so we need
+        # to double quote off the directory. However, the path ends
+        # in a backslash, so we need to remove this, lest it escape the
+        # last double quote off, confusing MSBuild
+        common_build_postfix = [
+            "--directory=&quot;$(ProjectDir.TrimEnd(&apos;\\&apos;))&quot;",
+            "progress=no",
+            f"platform={platform}",
+            f"target={target}",
+            f"arch={arch}",
+        ]
+
+        for arg, value in filtered_args.items():
+            common_build_postfix.append(f"{arg}={value}")
+
+        cmd_rebuild = [
+            "vsproj=yes",
+            f"vsproj_name={project_name}",
+        ] + common_build_postfix
+
+        cmd_clean = [
+            "--clean",
+        ] + common_build_postfix
+
+        commands = "scons"
+        if len(common_build_prefix) == 0:
+            commands = "echo Starting SCons &amp;&amp; cmd /V /C " + commands
+        else:
+            common_build_prefix[0] = "echo Starting SCons &amp;&amp; cmd /V /C " + common_build_prefix[0]
+
+        cmd = " ^&amp; ".join(common_build_prefix + [" ".join([commands] + common_build_postfix)])
+        props_template = props_template.replace("%%BUILD%%", cmd)
+
+        cmd = " ^&amp; ".join(common_build_prefix + [" ".join([commands] + cmd_rebuild)])
+        props_template = props_template.replace("%%REBUILD%%", cmd)
+
+        cmd = " ^&amp; ".join(common_build_prefix + [" ".join([commands] + cmd_clean)])
+        props_template = props_template.replace("%%CLEAN%%", cmd)
+
+        with open(f"{project_name}.{platform}.{target}.{arch}.generated.props", "w") as f:
+            f.write(props_template)
+
+    proj_uuid = str(uuid.uuid4())
+    sln_uuid = str(uuid.uuid4())
+
+    if os.path.exists(f"{project_name}.sln"):
+        for line in open(f"{project_name}.sln", "r").read().splitlines():
+            if line.startswith('Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}")'):
+                proj_uuid = re.search(
+                    r"\"{(\b[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-\b[0-9a-fA-F]{12}\b)}\"$",
+                    line,
+                ).group(1)
+            elif line.strip().startswith("SolutionGuid ="):
+                sln_uuid = re.search(
+                    r"{(\b[0-9a-fA-F]{8}\b-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-\b[0-9a-fA-F]{12}\b)}", line
+                ).group(1)
+                break
+
+    configurations = []
+    imports = []
+    properties = []
+    section1 = []
+    section2 = []
+    for conf in confs:
+        godot_platform = conf["platform"]
+        for p in conf["arches"]:
+            sln_plat = p["platform"]
+            proj_plat = sln_plat
+            godot_arch = p["architecture"]
+
+            # Redirect editor configurations for non-Windows platforms to the Windows one, so the solution has all the permutations
+            # and VS doesn't complain about missing project configurations.
+            # These configurations are disabled, so they show up but won't build.
+            if godot_platform != "windows":
+                section1 += [f"editor|{sln_plat} = editor|{proj_plat}"]
+                section2 += [
+                    f"{{{proj_uuid}}}.editor|{proj_plat}.ActiveCfg = editor|{proj_plat}",
+                ]
+
+            for t in conf["targets"]:
+                godot_target = t
+
+                # Windows x86 is a special little flower that requires a project platform == Win32 but a solution platform == x86.
+                if godot_platform == "windows" and godot_target == "editor" and godot_arch == "x86_32":
+                    sln_plat = "x86"
+
+                configurations += [
+                    f'<ProjectConfiguration Include="{godot_target}|{proj_plat}">',
+                    f"  <Configuration>{godot_target}</Configuration>",
+                    f"  <Platform>{proj_plat}</Platform>",
+                    "</ProjectConfiguration>",
+                ]
+
+                if godot_platform != "windows":
+                    configurations += [
+                        f'<ProjectConfiguration Include="editor|{proj_plat}">',
+                        f"  <Configuration>editor</Configuration>",
+                        f"  <Platform>{proj_plat}</Platform>",
+                        "</ProjectConfiguration>",
+                    ]
+
+                p = f"{project_name}.{godot_platform}.{godot_target}.{godot_arch}.generated.props"
+                imports += [
+                    f'<Import Project="$(MSBuildProjectDirectory)\\{p}" Condition="Exists(\'$(MSBuildProjectDirectory)\\{p}\')"/>'
+                ]
+
+                section1 += [f"{godot_target}|{sln_plat} = {godot_target}|{sln_plat}"]
+
+                section2 += [
+                    f"{{{proj_uuid}}}.{godot_target}|{sln_plat}.ActiveCfg = {godot_target}|{proj_plat}",
+                    f"{{{proj_uuid}}}.{godot_target}|{sln_plat}.Build.0 = {godot_target}|{proj_plat}",
+                ]
+
+    section1 = sorted(section1)
+    section2 = sorted(section2)
+
+    proj_template = open("misc/msvs/vcxproj.template", "r").read()
+
+    proj_template = proj_template.replace("%%UUID%%", proj_uuid)
+    proj_template = proj_template.replace("%%CONFS%%", "\n    ".join(configurations))
+    proj_template = proj_template.replace("%%IMPORTS%%", "\n  ".join(imports))
+    proj_template = proj_template.replace("%%DEFAULT_ITEMS%%", "\n    ".join(all_items))
+    proj_template = proj_template.replace("%%PROPERTIES%%", "\n  ".join(properties))
+
+    with open(f"{project_name}.vcxproj", "w") as f:
+        f.write(proj_template)
+
+    sln_template = open("misc/msvs/sln.template", "r").read()
+    sln_template = sln_template.replace("%%NAME%%", project_name)
+    sln_template = sln_template.replace("%%UUID%%", proj_uuid)
+    sln_template = sln_template.replace("%%SLNUUID%%", sln_uuid)
+    sln_template = sln_template.replace("%%SECTION1%%", "\n    ".join(section1))
+    sln_template = sln_template.replace("%%SECTION2%%", "\n    ".join(section2))
+    with open(f"{project_name}.sln", "w") as f:
+        f.write(sln_template)
+
+    if get_bool(original_args, "vsproj_gen_only", True):
+        sys.exit()
